@@ -52,11 +52,46 @@ else:
 
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 SEEN_JOBS_FILE = os.path.join(BASE_DIR, "seen_jobs.json")
+# Hashes of every job already sent to the AI (approved or rejected), so rejected jobs
+# are not re-evaluated (and re-billed) on every run.
+EVALUATED_FILE = os.path.join(BASE_DIR, "evaluated_jobs.json")
+EVALUATED_TTL_DAYS = 45
+PROFILE_FILE = os.path.join(BASE_DIR, "profile.md")
+# Every AI evaluation with its score breakdown - used to tune the weights from your feedback.
+EVAL_LOG_FILE = os.path.join(BASE_DIR, "evaluations_log.jsonl")
+STATE_FILE = os.path.join(BASE_DIR, "state.json")
+# "fast" = no headless browser (runs often); "full" = also renders JS-heavy career sites
+SCAN_MODE = os.getenv("SCAN_MODE", "full").strip().lower()
+
+
+def title_key(company, title):
+    """Cross-source identity (same job on the career page and on LinkedIn)."""
+    norm = lambda x: re.sub(r"[^a-z0-9\u0590-\u05ff]+", " ", str(x).lower()).strip()
+    return "ct:" + norm(company) + "|" + norm(title)
+
+
+def url_key(url):
+    u = re.sub(r"[?#].*$", "", str(url).strip().lower()).rstrip("/")
+    return "url:" + re.sub(r"^https?://(www\.)?", "", u)
+
+
+def append_eval_log(job, ev):
+    rec = {
+        "ts": datetime.now().isoformat(timespec="minutes"),
+        "company": job["company"], "title": job["title"], "url": job["url"],
+        "source": job.get("source", "career_page"),
+        "score": ev.get("match_score"), "approved": ev.get("approved"),
+        "breakdown": ev.get("score_breakdown", []), "reason": ev.get("match_reason", ""),
+        "rejection": ev.get("rejection_reason", ""),
+        "facts": {k: ev.get(k) for k in ("min_years_required", "core_stack_match", "must_have_missing_core",
+                                         "must_have_missing_other", "fullstack_in_title", "ai_involvement", "realistic_chance")},
+    }
+    with open(EVAL_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "progress_checkpoint.json")
 OUTPUT_EXCEL = os.path.join(BASE_DIR, f"new_jobs_{datetime.now().strftime('%Y%m%d')}.xlsx")
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
+import llm
 
 DEFAULT_CONFIG = {
     "min_yoe": 0,
@@ -118,13 +153,26 @@ def load_user_config():
     raw = load_json(CONFIG_FILE, {})
     cfg = DEFAULT_CONFIG.copy()
     if isinstance(raw, dict):
-        for k in DEFAULT_CONFIG:
-            if k in raw and raw[k] is not None:
-                cfg[k] = raw[k]
+        for k, v in raw.items():
+            if v is not None:
+                cfg[k] = v
     return cfg
 
 
+def load_candidate_profile():
+    """CV text: CANDIDATE_PROFILE secret first, then a local profile.md file."""
+    env_profile = os.getenv("CANDIDATE_PROFILE", "").strip()
+    if env_profile:
+        return env_profile
+    if os.path.exists(PROFILE_FILE):
+        with open(PROFILE_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return ""
+
+
 USER_CONFIG = load_user_config()
+CANDIDATE_PROFILE = load_candidate_profile()
+MIN_MATCH_SCORE = int(USER_CONFIG.get("min_match_score", 60))
 TARGET_LOCATION = str(USER_CONFIG.get("location", "Israel")).strip() or "Israel"
 IS_ISRAEL_TARGET = TARGET_LOCATION.lower() in ("israel", "ישראל")
 
@@ -141,7 +189,8 @@ FOREIGN_LOCATION_REGEX = re.compile(
     r"poland|warsaw|krakow|india|bangalore|bengaluru|hyderabad|pune|gurgaon|"
     r"canada|toronto|vancouver|new[\s\-_]+york|nyc\b|san[\s\-_]+francisco|california|seattle|"
     r"chicago|austin|texas|boston|paris|france|amsterdam|netherlands|dublin|ireland|"
-    r"tokyo|japan|spain|madrid|barcelona|brazil|mexico|colombia|philippines|vietnam)\b",
+    r"tokyo|japan|spain|madrid|barcelona|brazil|mexico|colombia|philippines|vietnam|"
+    r"china|shenzhen|shanghai|beijing|taiwan|taipei|korea|seoul|us government|usa\b|united states|romania|bucharest|ukraine|kyiv|portugal|lisbon)\b",
     re.IGNORECASE
 )
 
@@ -165,6 +214,7 @@ NON_JOB_URL_PATTERNS = re.compile(
     r"|/alljobs"
     r"|/career-opportunities/students-internship"
     r"|developer-zone|developer_zone|developers|documentation|/docs/|/blog/|/resources/|/community/|/about/|/contact/|/news/"
+    r"|/products?/|/solutions?/|/platform/|/features?/|/use-cases?/|/customers?/|/events?/|/webinars?/|/glossary/"
     r")",
     re.IGNORECASE
 )
@@ -219,40 +269,48 @@ def build_reject_title_regex(cfg):
     if "devops" in excluded_lower:
         patterns.extend([r"devops", r"sre\b", r"infrastructure engineer", r"sysadmin", r"system administrator"])
 
-    if max_yoe <= 2:
+    if max_yoe <= 3:
         patterns.extend([
             r"vp\b", r"director", r"chief", r"head of", r"lead\b",
-            r"principal", r"staff\b", r"architect", r"manager\b", r"senior", r"sr\b", r"expert"
+            r"principal", r"staff\b", r"architect", r"manager\b", r"senior", r"sr\b", r"expert", r"leader"
         ])
 
     return re.compile(r"\b(" + "|".join(patterns) + r")\b", re.IGNORECASE)
 
 
+SEP = r"[\s\-_/\.]*"  # "full stack", "full-stack", "full_stack", "fullstack", "full/stack"
+
+# A real job title must name a ROLE, not just a topic ("AI Security" is a product page, not a job).
+ROLE_EN_REGEX = re.compile(
+    r"\b(" + "|".join([
+        r"engineers?", r"developers?", r"programmers?", r"devs?", r"swe",
+        rf"full{SEP}stack", rf"back{SEP}end", rf"front{SEP}end",
+        r"scientists?", r"researchers?",
+    ]) + r")\b",
+    re.IGNORECASE,
+)
+# Hebrew: no \b, so prefixes (ו/ל/ה/ב) and gender forms (מפתח/ת, מפתחת) still match.
+ROLE_HE_REGEX = re.compile(
+    r"(מפתח|מתכנת|מהנדס|פיתוח|חוקר|" + rf"פול{SEP}סטא?ק|בק{SEP}אנד|פרונט{SEP}אנד)"
+)
+# Roles that are clearly not a fit for a web/AI developer.
+REJECT_DOMAIN_REGEX = re.compile(
+    r"\b(vlsi|asic|soc|fpga|rf|analog|mixed[\s\-]signal|physical[\s\-]design|layout|chip|silicon|"
+    r"hardware|mechanical|electrical|photonic\w*|optic\w*|laser|firmware|embedded|kernel|bsp|dsp|"
+    r"verification|validation|manufacturing|process|equipment|reliability|yield|test[\s\-]engineer|"
+    r"network[\s\-]engineer|it[\s\-]engineer|solutions?[\s\-]engineer|sales[\s\-]engineer|pre[\s\-]?sales|"
+    r"support|customer|field|application[\s\-]engineer|forward[\s\-]deployed|government|data[\s\-]analyst|"
+    r"devops|dev[\s\-]ops|sre|site[\s\-]reliability|security[\s\-]engineers?|cloud[\s\-]engineer|cloud[\s\-]monitoring|"
+    r"data[\s\-]engineer|data[\s\-]scientist|bi|etl|test[\s\-]development|qa|student|intern|internship)\b",
+    re.IGNORECASE,
+)
+REJECT_HE_REGEX = re.compile(r"(בכיר|ראש צוות|ראש קבוצת|מנהל|מנהלת|סטודנט|מתמח|חומרה|אנלוג|שיווק|מכירות|תמיכה)")
+
+
 def build_candidate_title_regex(cfg):
-    base_keywords = [
-        r"software", r"developer", r"engineer", r"fullstack", r"full-stack",
-        r"backend", r"back-end", r"frontend", r"front-end",
-        r"ai\b", r"ml\b", r"machine learning", r"deep learning",
-        r"data scientist", r"data science", r"data analyst", r"algorithms?",
-        r"computer vision", r"nlp\b", r"mlops", r"embedded", r"firmware",
-        r"python", r"java\b", r"c\+\+", r"golang", r"react", r"node",
-        r"automation", r"tools developer", r"product engineer"
-    ]
+    """Kept for compatibility: a title is a candidate if it names a role (EN or HE)."""
+    return ROLE_EN_REGEX
 
-    if cfg.get("include_student_and_graduate", True):
-        base_keywords.extend([r"intern\b", r"internship", r"student", r"graduate", r"grad\b"])
-
-    if int(cfg.get("max_yoe", 2)) <= 2:
-        base_keywords.extend([r"junior", r"entry[\s\-_]*level"])
-
-    for role in cfg.get("target_roles", []):
-        tokens = re.findall(r"[a-zA-Z0-9\+\-#]+", str(role).lower())
-        for tok in tokens:
-            if len(tok) >= 2:
-                base_keywords.append(re.escape(tok))
-
-    unique_keywords = list(dict.fromkeys(base_keywords))
-    return re.compile(r"\b(" + "|".join(unique_keywords) + r")\b", re.IGNORECASE)
 
 
 REJECT_TITLE_REGEX = build_reject_title_regex(USER_CONFIG)
@@ -277,8 +335,16 @@ def has_excessive_min_yoe(text, max_allowed_yoe):
         re.IGNORECASE
     )
 
+    nice_to_have = re.compile(r"advantage|nice[\s\-]to[\s\-]have|bonus|preferred|a plus|\bplus\b|יתרון", re.IGNORECASE)
+
     for match in pattern.finditer(text):
         full_phrase = match.group(0).lower()
+        # Skip years mentioned only as an advantage (same line)
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        line = text[line_start:line_end if line_end != -1 else len(text)]
+        if nice_to_have.search(line):
+            continue
         min_years = int(match.group(1))
         # Ignore company age / founding references like "25 years of experience in insurance"
         if "company" in full_phrase or "founded" in full_phrase or "industry leader" in full_phrase:
@@ -298,63 +364,18 @@ def compute_job_hash(company, title, url):
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
-def call_gemini_with_retries(payload, timeout=45):
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is missing from environment or .env file!")
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
-    )
-    max_attempts = 5
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            res = requests.post(url, json=payload, timeout=timeout)
-            if res.status_code == 200:
-                return res.json()
-
-            print(f"    [!] Gemini HTTP {res.status_code} ({attempt}/{max_attempts})")
-            if res.status_code not in (408, 429, 500, 502, 503, 504):
-                print(f"        Details: {res.text[:200]}")
-                raise RuntimeError(f"Non-retryable HTTP {res.status_code}")
-
-            if attempt == max_attempts:
-                break
-
-            wait_time = min(4 * (2 ** (attempt - 1)), 45)
-            print(f"        Retrying in {wait_time}s...")
-            time.sleep(wait_time)
-
-        except requests.exceptions.RequestException as exc:
-            print(f"    [!] Gemini network error ({attempt}/{max_attempts}): {exc}")
-            if attempt == max_attempts:
-                raise RuntimeError("Gemini API unreachable after retries") from exc
-            wait_time = min(4 * (2 ** (attempt - 1)), 45)
-            print(f"        Retrying in {wait_time}s...")
-            time.sleep(wait_time)
-
-    raise RuntimeError("Gemini API unavailable after maximum retries.")
-
-
-def test_gemini_preflight():
+def test_ai_preflight():
     print("=" * 60)
-    print(f" [*] PRE-FLIGHT CHECK: Testing Gemini AI ({MODEL_NAME})...")
+    print(f" [*] PRE-FLIGHT CHECK: Testing AI engine: {llm.describe()}...")
     print(f" [*] Active Config: YOE {USER_CONFIG['min_yoe']}-{USER_CONFIG['max_yoe']} | Location: {TARGET_LOCATION}")
     print(f" [*] Playwright Headless Fallback: {'ENABLED' if PLAYWRIGHT_AVAILABLE else 'DISABLED'}")
     print("=" * 60)
-
-    if not GEMINI_API_KEY:
-        print("[!] ERROR: GEMINI_API_KEY is not defined in your environment or GitHub Secrets!")
+    try:
+        llm.complete_text("Reply with strictly the word: OK", timeout=60)
+    except Exception as exc:
+        print(f"[!] ERROR: AI engine not working: {exc}")
         sys.exit(1)
-
-    payload = {
-        "contents": [{"parts": [{"text": "Reply with strictly the word: OK"}]}],
-        "generationConfig": {"temperature": 0.0}
-    }
-
-    call_gemini_with_retries(payload, timeout=20)
-    print(f"[✓] AI Pre-flight Check SUCCESSFUL! Model {MODEL_NAME} is active.\n")
+    print("[✓] AI Pre-flight Check SUCCESSFUL!\n")
     return True
 
 
@@ -476,8 +497,8 @@ def try_ats_api_scrape(company_info, url):
 # --- HTML Scraping Logic ---
 
 def is_title_candidate(title, url=""):
-    t = title.strip()
-    if len(t) < 4 or len(t) > 130:
+    t = re.sub(r"\s+", " ", title).strip()
+    if len(t) < 4 or len(t) > 110:
         return False
     if NAV_EXCLUDE_REGEX.match(t):
         return False
@@ -490,11 +511,9 @@ def is_title_candidate(title, url=""):
             return False
         if FOREIGN_LOCATION_REGEX.search(f"{t} {url}") and not ISRAEL_LOCATION_REGEX.search(f"{t} {url}"):
             return False
-    if REJECT_TITLE_REGEX.search(t):
+    if REJECT_TITLE_REGEX.search(t) or REJECT_HE_REGEX.search(t) or REJECT_DOMAIN_REGEX.search(t):
         return False
-    if CANDIDATE_TITLE_REGEX.search(t):
-        return True
-    return False
+    return bool(ROLE_EN_REGEX.search(t) or ROLE_HE_REGEX.search(t))
 
 
 def extract_candidates_from_soup(soup, base_url, company_info):
@@ -736,92 +755,177 @@ def fetch_missing_details_with_playwright(jobs_list):
 
 # --- Strict 4-Way Config-Driven Batch AI Evaluation ---
 
+DEFAULT_SCORING = {
+    "base": 50,
+    "years_ok": 10,             # required minimum <= candidate_years + 0.5
+    "years_unstated": 5,        # posting doesn't say
+    "years_stretch": 0,         # required minimum between that and max_yoe (e.g. 3)
+    "stack_strong": 15,         # the role's main stack is what the candidate works with
+    "stack_partial": 5,
+    "stack_none": -10,
+    "missing_core": -20,        # each missing MUST-HAVE that is central to the role (main language/framework)
+    "missing_other": -6,        # each missing MUST-HAVE that is secondary (a tool, a DB, a cloud service)
+    "missing_cap": -40,
+    "fullstack_title": 15,
+    "fullstack_description": 5,
+    "ai_product": 12,           # builds AI/LLM features (agents, RAG, LLM integrations) as an engineer
+    "ai_tools": 3,              # only mentions AI-assisted development / AI tools
+    "chance_high": 5,
+    "chance_low": -10,
+}
+
+def compute_match_score(ev):
+    """
+    Deterministic, explainable score from the AI's structured findings.
+    Returns (score or None if disqualified, breakdown list of Hebrew strings).
+    """
+    w = dict(DEFAULT_SCORING)
+    w.update(USER_CONFIG.get("scoring") or {})
+    max_yoe = int(USER_CONFIG.get("max_yoe", 3))
+    candidate_years = float(USER_CONFIG.get("candidate_years", 1.5))
+    parts = []
+
+    min_req = ev.get("min_years_required")
+    try:
+        min_req = None if min_req in (None, "") else float(min_req)
+    except (TypeError, ValueError):
+        min_req = None
+    if min_req is not None and min_req > max_yoe:
+        return None, [f"דורש {int(min_req)} שנים ומעלה"]
+
+    score = w["base"]
+    if min_req is None:
+        score += w["years_unstated"]; parts.append(f"שנים לא צוינו {w['years_unstated']:+d}")
+    elif min_req <= candidate_years + 0.5:
+        score += w["years_ok"]; parts.append(f"דורש {min_req:g} שנים {w['years_ok']:+d}")
+    else:
+        score += w["years_stretch"]; parts.append(f"דורש {min_req:g} שנים {w['years_stretch']:+d}")
+
+    stack = str(ev.get("core_stack_match", "")).lower()
+    if stack in ("strong", "partial", "none"):
+        pts = w["stack_" + stack]
+        score += pts
+        label = {"strong": "סטאק תואם", "partial": "סטאק תואם חלקית", "none": "סטאק לא תואם"}[stack]
+        parts.append(f"{label} {pts:+d}")
+
+    core = ev.get("must_have_missing_core") or []
+    other = ev.get("must_have_missing_other") or []
+    missing_pts = max(w["missing_cap"], w["missing_core"] * len(core) + w["missing_other"] * len(other))
+    if core or other:
+        score += missing_pts
+        names = ", ".join(list(core) + list(other))
+        parts.append(f"חסר כחובה: {names} {missing_pts:+d}")
+
+    if ev.get("fullstack_in_title"):
+        score += w["fullstack_title"]; parts.append(f"פול סטאק בכותרת {w['fullstack_title']:+d}")
+    elif ev.get("fullstack_in_description"):
+        score += w["fullstack_description"]; parts.append(f"פול סטאק בתיאור {w['fullstack_description']:+d}")
+    ai = str(ev.get("ai_involvement", "")).lower()
+    if ai == "product":
+        score += w["ai_product"]; parts.append(f"בונה מוצר בינה מלאכותית {w['ai_product']:+d}")
+    elif ai == "tools":
+        score += w["ai_tools"]; parts.append(f"עבודה עם כלי בינה מלאכותית {w['ai_tools']:+d}")
+
+    chance = str(ev.get("realistic_chance", "")).lower()
+    if chance == "high":
+        score += w["chance_high"]; parts.append(f"סיכוי גבוה לזימון {w['chance_high']:+d}")
+    elif chance == "low":
+        score += w["chance_low"]; parts.append(f"סיכוי נמוך לזימון {w['chance_low']:+d}")
+
+    return max(0, min(100, int(score))), parts
+
+
 def batch_verify_jobs_with_ai(jobs_batch):
-    min_yoe = int(USER_CONFIG.get("min_yoe", 0))
-    max_yoe = int(USER_CONFIG.get("max_yoe", 2))
+    max_yoe = int(USER_CONFIG.get("max_yoe", 3))
+    candidate_years = USER_CONFIG.get("candidate_years", 1.5)
     target_roles_str = ", ".join(USER_CONFIG.get("target_roles", []))
     excluded_roles_str = ", ".join(USER_CONFIG.get("excluded_roles", []))
-    include_students = USER_CONFIG.get("include_student_and_graduate", True)
-
-    student_clause = (
-        "including Junior, Graduate, Student Developer, Intern, or Entry Level roles"
-        if include_students else
-        "excluding Student/Intern roles unless they meet the full-time YOE range"
-    )
 
     location_clause = (
-        f"MUST be located in {TARGET_LOCATION} (Tel Aviv, Haifa, Herzliya, Jerusalem, etc., Hybrid, Remote {TARGET_LOCATION}, or an Israeli company with no foreign office mentioned). "
-        f"STRICTLY REJECT any position located outside {TARGET_LOCATION} (e.g. Germany, Walldorf, Berlin, Bangkok, London, New York, Poland, India, or having (m/f/d))."
-        if IS_ISRAEL_TARGET else
-        f"MUST match the target location: {TARGET_LOCATION}."
+        f"MUST be located in {TARGET_LOCATION} (any Israeli city, Hybrid, or Remote {TARGET_LOCATION}). "
+        f"REJECT positions located outside {TARGET_LOCATION}."
+        if IS_ISRAEL_TARGET else f"MUST match the target location: {TARGET_LOCATION}."
     )
 
     items_text = []
     for idx, j in enumerate(jobs_batch, 1):
-        snippet = j.get("requirements_text", "").strip()
-        loc = j.get("page_location", "Unspecified")
         items_text.append(
             f"=== Job #{idx} ===\n"
-            f"Company: {j['company']}\n"
-            f"Title: {j['title']}\n"
-            f"URL: {j['url']}\n"
-            f"Detected Page Location: {loc}\n"
-            f"Full Job Description & Requirements:\n{snippet[:5500]}\n"
+            f"Company: {j['company']}\nTitle: {j['title']}\nURL: {j['url']}\n"
+            f"Detected Page Location: {j.get('page_location', 'Unspecified')}\n"
+            f"Full Job Description & Requirements:\n{j.get('requirements_text', '').strip()[:5500]}\n"
         )
 
-    prompt = (
-        "You are an expert technical hiring validator.\n"
-        "Carefully read the FULL text of each job posting below, paying close attention to the requirements section "
-        "and location specifications, and evaluate each posting based on 4 mandatory criteria:\n\n"
-        "1. Single Specific Job Vacancy (is_single_specific_job):\n"
-        "   - MUST be an actual, individual, open job vacancy posting with a concrete description.\n"
-        "   - STRICTLY REJECT: Category lobbies, search results pages, recruitment agency general hubs, generic 'Send CV / Join Talent Pool' forms.\n\n"
-        "2. Target Role Match (is_target_role):\n"
-        f"   - MUST match one of these target roles: {target_roles_str}.\n"
-        f"   - STRICTLY REJECT these excluded roles: {excluded_roles_str}.\n\n"
-        f"3. Experience Level {min_yoe}-{max_yoe} YOE (is_matching_yoe):\n"
-        f"   - MUST accept candidates within {min_yoe} to {max_yoe} years of experience ({student_clause}).\n"
-        f"   - Ranges whose MINIMUM is <= {max_yoe} (such as '1-3 years' or '2-3 years') ARE ALLOWED.\n"
-        f"   - STRICTLY REJECT any posting whose MINIMUM required experience is >= {max_yoe + 1} years (e.g. '3+ years', '3-5 years', 'at least 3 years', '4+ years', '5+ years').\n\n"
-        f"4. Target Location (is_matching_location):\n"
-        f"   - {location_clause}\n\n"
-        "Candidate Postings:\n"
-        f"{''.join(items_text)}\n"
-        "A job is APPROVED only if ALL FOUR criteria are strictly TRUE.\n\n"
-        "Output strictly valid JSON with this exact structure:\n"
-        "{\n"
-        '  "evaluations": [\n'
-        "    {\n"
-        '      "job_index": 1,\n'
-        '      "is_single_specific_job": true/false,\n'
-        '      "is_target_role": true/false,\n'
-        '      "is_matching_yoe": true/false,\n'
-        '      "is_matching_location": true/false,\n'
-        '      "approved": true/false,\n'
-        f'      "experience_summary": "e.g. {min_yoe}-{max_yoe} YOE summary",\n'
-        f'      "detected_city": "e.g. Tel Aviv / {TARGET_LOCATION}",\n'
-        '      "rejection_reason": "short explanation if rejected"\n'
-        "    }\n"
-        "  ]\n"
-        "}"
+    profile_block = (
+        "=== CANDIDATE PROFILE ===\n" + CANDIDATE_PROFILE[:6000] + "\n=== END PROFILE ===\n\n"
+        if CANDIDATE_PROFILE else ""
     )
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.0,
-            "responseMimeType": "application/json"
-        }
-    }
+    prompt = (
+        "You are an expert technical recruiter in the Israeli tech market. For each job posting below, "
+        "extract structured facts. Do NOT compute any score yourself.\n\n"
+        f"{profile_block}"
+        f"The candidate has about {candidate_years} years of professional experience.\n\n"
+        "For each job decide:\n"
+        "- is_single_specific_job: a real, individual open vacancy (not a category page, search page, talent pool or 'send CV' form).\n"
+        f"- is_target_role: matches one of [{target_roles_str}] and is NOT one of [{excluded_roles_str}].\n"
+        f"- is_matching_location: {location_clause}\n"
+        "- min_years_required: the MINIMUM years of professional experience the posting REQUIRES overall "
+        "(e.g. '3-5 years' -> 3, '2+ years' -> 2). Ignore years mentioned only as an advantage/nice-to-have/bonus/'יתרון'. "
+        "If it requires N years in one specific technology as a must, use that N if it is higher. null if not stated.\n"
+        "- core_stack_match: 'strong' if the role's MAIN languages/frameworks are ones the candidate works with "
+        "(e.g. TypeScript/Node/React/Vue/Python), 'partial' if some of them, 'none' if the main stack is something else.\n"
+        "- must_have_missing_core: REQUIRED/MUST skills the candidate lacks that are CENTRAL to the role "
+        "(the main programming language or main framework, e.g. Java, C#, Go, C++, Angular).\n"
+        "- must_have_missing_other: REQUIRED/MUST skills the candidate lacks that are SECONDARY "
+        "(a specific tool, database, queue, cloud service, testing framework).\n"
+        "  For both lists: do NOT include anything under advantage / nice to have / bonus / plus / 'יתרון'. "
+        "Treat close equivalents as known (React~Vue, Node~NestJS, AWS~any cloud, MongoDB~PostgreSQL~SQL, Docker~containers). "
+        "Use short tech names. Empty list if nothing missing.\n"
+        "- nice_to_have_missing: advantage-only skills the candidate lacks (informational).\n"
+        "- fullstack_in_title: the job TITLE says Full Stack / Fullstack / Full-Stack.\n"
+        "- fullstack_in_description: the description describes full-stack work (both frontend and backend).\n"
+        "- ai_involvement: 'product' if the engineer will BUILD AI features in the product (LLM integrations, agents, RAG, "
+        "AI APIs, AI-powered workflows) as an application/software engineer; 'research' if it is model training / ML research / "
+        "data science that needs an ML/math background; 'tools' if the posting only mentions using AI coding tools "
+        "(Cursor, Copilot, Claude Code) or 'AI-first engineering culture'; 'none' otherwise.\n"
+        "- realistic_chance: 'high' / 'medium' / 'low' - your honest estimate that a recruiter would call this candidate "
+        "for an interview, given his experience and the must-haves.\n"
+        "- match_reason: ONE short sentence IN HEBREW: what fits and what is missing.\n\n"
+        "Candidate Postings:\n"
+        f"{''.join(items_text)}\n"
+        "Output ONLY valid JSON, no prose, with this exact structure:\n"
+        '{"evaluations": [{"job_index": 1, "is_single_specific_job": true, "is_target_role": true, '
+        '"is_matching_location": true, "min_years_required": 2, "core_stack_match": "partial", '
+        '"must_have_missing_core": ["Java"], "must_have_missing_other": ["Kafka"], '
+        '"nice_to_have_missing": ["GraphQL"], "fullstack_in_title": true, "fullstack_in_description": true, '
+        '"ai_involvement": "tools", "realistic_chance": "medium", "experience_summary": "2+ years", '
+        '"detected_city": "Tel Aviv", "match_reason": "..."}]}'
+    )
 
     try:
-        data = call_gemini_with_retries(payload, timeout=45)
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        parsed = json.loads(raw_text)
-        return parsed.get("evaluations", [])
+        parsed = llm.complete_json(prompt)
     except Exception as e:
         print(f"    [!] Error during batch AI verification: {e}")
         return []
+
+    evaluations = parsed.get("evaluations", []) if isinstance(parsed, dict) else []
+    for ev in evaluations:
+        basic_ok = all(ev.get(k) for k in ("is_single_specific_job", "is_target_role", "is_matching_location"))
+        try:
+            ev["job_index"] = int(ev.get("job_index"))
+        except (TypeError, ValueError):
+            pass
+        score, breakdown = compute_match_score(ev)
+        ev["match_score"] = score
+        ev["score_breakdown"] = breakdown
+        ev["approved"] = bool(basic_ok and score is not None)
+        if not basic_ok:
+            failed = [k for k in ("is_single_specific_job", "is_target_role", "is_matching_location") if not ev.get(k)]
+            ev["rejection_reason"] = "failed: " + ", ".join(failed)
+        elif score is None:
+            ev["rejection_reason"] = f"requires {ev.get('min_years_required')}+ years"
+    return evaluations
 
 
 # --- Excel Generation ---
@@ -878,7 +982,7 @@ def export_to_excel(confirmed_jobs, unreached_companies, filepath):
 # --- Main Execution ---
 
 def main():
-    test_gemini_preflight()
+    test_ai_preflight()
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Loading companies registry: {os.path.basename(MASTER_FILE)}...")
 
@@ -886,6 +990,24 @@ def main():
     companies_by_name = {c["name"]: c for c in companies}
     seen_jobs = load_json(SEEN_JOBS_FILE, [])
     seen_hashes = {compute_job_hash(j["company"], j["title"], j["url"]) for j in seen_jobs}
+
+    # Previously evaluated (incl. rejected) jobs - pruned after EVALUATED_TTL_DAYS
+    evaluated = load_json(EVALUATED_FILE, {})
+    cutoff = time.time() - EVALUATED_TTL_DAYS * 86400
+    evaluated = {h: ts for h, ts in evaluated.items() if ts >= cutoff}
+    seen_hashes |= set(evaluated.keys())
+    notify_this_run = []
+    borderline_this_run = []
+    state = load_json(STATE_FILE, {})
+    backfill = not state.get("backfill_done", False)
+    max_ai_jobs = int(USER_CONFIG.get("max_ai_jobs_per_run", 80))
+    backfill_left = False
+    print(f"[*] Scan mode: {SCAN_MODE} | LinkedIn backfill (last month): {'yes' if backfill else 'no'} | AI cap per run: {max_ai_jobs}")
+
+    if CANDIDATE_PROFILE:
+        print(f"[*] Candidate profile loaded ({len(CANDIDATE_PROFILE)} chars) - min match score: {MIN_MATCH_SCORE}")
+    else:
+        print("[i] No candidate profile (CANDIDATE_PROFILE / profile.md) - CV scoring disabled")
 
     checkpoint = load_json(CHECKPOINT_FILE, {
         "scraped_companies": [],
@@ -950,7 +1072,9 @@ def main():
                     print(f"  -> Progress: {completed_count}/{len(remaining_companies)} companies scraped ({len(direct_candidates)} candidates found)...")
 
         # STAGE 1B: Playwright Headless Fallback for JS/SPA sites
-        recovered, failed_companies = scrape_spa_with_playwright(failed_companies, companies_by_name)
+        recovered = []
+        if SCAN_MODE == "full":
+            recovered, failed_companies = scrape_spa_with_playwright(failed_companies, companies_by_name)
         if recovered:
             direct_candidates.extend(recovered)
             checkpoint["failed_companies"] = failed_companies
@@ -962,13 +1086,30 @@ def main():
     print(f"\n[Stage 1 Summary] Successful: {len(companies) - len(failed_companies)} | Un-scraped/LinkedIn: {len(failed_companies)}")
     print(f"[*] Total candidate links collected: {len(direct_candidates)}")
 
+    # --- STAGE 1C: LinkedIn public job search ---
+    try:
+        from linkedin_source import collect_linkedin_candidates
+        li_candidates = collect_linkedin_candidates(
+            USER_CONFIG,
+            is_title_candidate,
+            lambda co, ti, u: compute_job_hash(co, ti, u) in seen_hashes or title_key(co, ti) in seen_hashes,
+            backfill=backfill,
+        )
+        direct_candidates.extend(li_candidates)
+    except Exception as exc:
+        print(f"[!] LinkedIn stage failed (continuing without it): {exc}")
+
     unique_candidates = []
     candidate_hashes = set()
     for cand in direct_candidates:
         h = compute_job_hash(cand["company"], cand["title"], cand["url"])
-        if h not in seen_hashes and h not in candidate_hashes:
-            candidate_hashes.add(h)
-            unique_candidates.append(cand)
+        tk = title_key(cand["company"], cand["title"])
+        uk = url_key(cand["url"])
+        keys = (h, tk, uk)
+        if any(k in seen_hashes or k in candidate_hashes for k in keys):
+            continue
+        candidate_hashes.update(keys)
+        unique_candidates.append(cand)
 
     print(f"[*] Brand-new unseen candidates to process: {len(unique_candidates)}")
 
@@ -978,7 +1119,8 @@ def main():
         with ThreadPoolExecutor(max_workers=8) as executor:
             fetched_candidates = list(executor.map(fetch_job_details, unique_candidates))
 
-        fetched_candidates = fetch_missing_details_with_playwright(fetched_candidates)
+        if SCAN_MODE == "full":
+            fetched_candidates = fetch_missing_details_with_playwright(fetched_candidates)
 
         max_allowed_yoe = int(USER_CONFIG.get("max_yoe", 2))
         ai_ready_candidates = []
@@ -993,10 +1135,18 @@ def main():
             excessive = has_excessive_min_yoe(txt, max_allowed_yoe)
             if excessive:
                 print(f"  [X] REJECTED (Min YOE > {max_allowed_yoe}: '{excessive[1]}'): {job['company']} - {job['title']}")
+                evaluated[compute_job_hash(job["company"], job["title"], job["url"])] = time.time()
                 continue
             ai_ready_candidates.append(job)
 
         print(f"[*] Candidates passing description & YOE pre-checks for AI review: {len(ai_ready_candidates)}")
+        if len(ai_ready_candidates) > max_ai_jobs:
+            # Not marked as evaluated -> picked up again by the next run.
+            print(f"[*] AI cap: evaluating {max_ai_jobs} now, {len(ai_ready_candidates) - max_ai_jobs} left for next runs")
+            ai_ready_candidates = ai_ready_candidates[:max_ai_jobs]
+            backfill_left = True
+        else:
+            backfill_left = False
 
         # --- STAGE 3: High-Precision Small-Batch AI Verification ---
         if ai_ready_candidates:
@@ -1008,7 +1158,7 @@ def main():
             default_exp_label = f"{USER_CONFIG['min_yoe']}-{USER_CONFIG['max_yoe']} YOE (AI Verified)"
 
             for b_idx, batch in enumerate(batches, 1):
-                print(f"[*] Sending Batch {b_idx}/{len(batches)} ({len(batch)} jobs) to Gemini...")
+                print(f"[*] Sending Batch {b_idx}/{len(batches)} ({len(batch)} jobs) to AI...")
                 evaluations = batch_verify_jobs_with_ai(batch)
 
                 eval_map = {ev.get("job_index"): ev for ev in evaluations}
@@ -1016,8 +1166,32 @@ def main():
                 for idx, job in enumerate(batch, 1):
                     ev = eval_map.get(idx)
                     h = compute_job_hash(job["company"], job["title"], job["url"])
+                    if ev:
+                        evaluated[h] = time.time()
+                        evaluated[title_key(job["company"], job["title"])] = time.time()
+                        evaluated[url_key(job["url"])] = time.time()
+                        append_eval_log(job, ev)
 
-                    if ev and ev.get("approved"):
+                    score = ev.get("match_score") if ev else None
+                    low_score = score is not None and score < MIN_MATCH_SCORE
+                    calib = USER_CONFIG.get("calibration") or {}
+                    is_borderline = (
+                        calib.get("enabled") and low_score and score >= int(calib.get("min_score", 40))
+                    )
+
+                    if ev and ev.get("approved") and low_score:
+                        print(f"  [X] LOW FIT ({score}): {job['company']} - {job['title']} ({ev.get('match_reason', '')})")
+                        if is_borderline:
+                            borderline_this_run.append({
+                                "company": job["company"], "title": job["title"], "url": job["url"],
+                                "location": ev.get("detected_city") or TARGET_LOCATION,
+                                "experience": ev.get("experience_summary", ""),
+                                "source": job.get("source", "career_page"),
+                                "match_score": score, "match_reason": ev.get("match_reason", ""),
+                                "score_breakdown": ev.get("score_breakdown", []),
+                                "posted": job.get("posted", ""),
+                            })
+                    elif ev and ev.get("approved"):
                         location = ev.get("detected_city") or TARGET_LOCATION
                         exp_sum = ev.get("experience_summary") or default_exp_label
 
@@ -1029,9 +1203,15 @@ def main():
                             "location": location,
                             "url": job["url"],
                             "experience": exp_sum,
-                            "discovered_at": datetime.now().isoformat()
+                            "discovered_at": datetime.now().isoformat(),
+                            "source": job.get("source", "career_page"),
+                            "match_score": score,
+                            "match_reason": ev.get("match_reason", ""),
+                            "score_breakdown": ev.get("score_breakdown", []),
+                            "posted": job.get("posted", ""),
                         }
                         confirmed_new_jobs.append(entry)
+                        notify_this_run.append(entry)
                         seen_jobs.append(entry)
                         seen_hashes.add(h)
                         print(f"  [✓] APPROVED: {job['company']} - {job['title']} [{location}] -> [Referral: {entry['referral_contact']}]")
@@ -1043,10 +1223,22 @@ def main():
                 checkpoint["pending_candidates"] = []
                 save_json(CHECKPOINT_FILE, checkpoint)
                 save_json(SEEN_JOBS_FILE, seen_jobs)
+                save_json(EVALUATED_FILE, evaluated)
                 export_to_excel(confirmed_new_jobs, failed_companies, OUTPUT_EXCEL)
 
     # --- STAGE 4: Finalization ---
+    if backfill and not backfill_left:
+        state["backfill_done"] = True
+        print("[*] LinkedIn month backfill complete - from now on only the last 24h.")
+    save_json(STATE_FILE, state)
     save_json(SEEN_JOBS_FILE, seen_jobs)
+    save_json(EVALUATED_FILE, evaluated)
+
+    try:
+        from notifier import notify_new_jobs
+        notify_new_jobs(notify_this_run, borderline_this_run)
+    except Exception as exc:
+        print(f"[!] Notification step failed: {exc}")
     export_to_excel(confirmed_new_jobs, failed_companies, OUTPUT_EXCEL)
 
     if os.path.exists(CHECKPOINT_FILE):

@@ -7,3 +7,5 @@ new_jobs_*.xlsx
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
+profile.md
