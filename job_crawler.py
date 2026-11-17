@@ -77,6 +77,7 @@ def url_key(url):
 
 def append_eval_log(job, ev):
     rec = {
+        "job_id": compute_job_hash(job["company"], job["title"], job["url"]),
         "ts": datetime.now().isoformat(timespec="minutes"),
         "company": job["company"], "title": job["title"], "url": job["url"],
         "source": job.get("source", "career_page"),
@@ -1000,6 +1001,12 @@ def main():
     borderline_this_run = []
     state = load_json(STATE_FILE, {})
     backfill = not state.get("backfill_done", False)
+    try:
+        import telegram_bot
+        telegram_bot.collect_feedback(state)
+        save_json(STATE_FILE, state)
+    except Exception as exc:
+        print(f"[!] Telegram feedback step failed: {exc}")
     max_ai_jobs = int(USER_CONFIG.get("max_ai_jobs_per_run", 80))
     backfill_left = False
     print(f"[*] Scan mode: {SCAN_MODE} | LinkedIn backfill (last month): {'yes' if backfill else 'no'} | AI cap per run: {max_ai_jobs}")
@@ -1190,6 +1197,7 @@ def main():
                                 "match_score": score, "match_reason": ev.get("match_reason", ""),
                                 "score_breakdown": ev.get("score_breakdown", []),
                                 "posted": job.get("posted", ""),
+                                "job_id": h,
                             })
                     elif ev and ev.get("approved"):
                         location = ev.get("detected_city") or TARGET_LOCATION
@@ -1209,6 +1217,7 @@ def main():
                             "match_reason": ev.get("match_reason", ""),
                             "score_breakdown": ev.get("score_breakdown", []),
                             "posted": job.get("posted", ""),
+                            "job_id": h,
                         }
                         confirmed_new_jobs.append(entry)
                         notify_this_run.append(entry)

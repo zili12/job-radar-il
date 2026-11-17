@@ -166,24 +166,38 @@ def send_email(jobs, borderline):
 
 
 def notify_new_jobs(jobs, borderline=None):
+    import telegram_bot
+
     borderline = borderline or []
     jobs = sorted(jobs, key=lambda j: -(j.get("match_score") or 0))
     borderline = sorted(borderline, key=lambda j: -(j.get("match_score") or 0))
 
-    pending = []
+    pending = {"whatsapp": [], "telegram": []}
     if os.path.exists(PENDING_FILE):
         try:
             with open(PENDING_FILE, encoding="utf-8") as f:
-                pending = json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, list):  # old format
+                loaded = {"whatsapp": loaded}
+            pending.update({k: v for k, v in loaded.items() if isinstance(v, list)})
         except Exception:
-            pending = []
+            pass
 
-    messages = list(pending) + build_whatsapp_messages(jobs, borderline)
-    if not messages:
+    if not (jobs or borderline or pending["whatsapp"] or pending["telegram"]):
         print("[i] No new jobs to notify about.")
-    failed = send_whatsapp(messages) if messages else []
+        return
+
+    wa_messages = pending["whatsapp"] + build_whatsapp_messages(jobs, borderline)
+    failed_wa = send_whatsapp(wa_messages) if wa_messages else []
+
+    failed_tg = []
+    if telegram_bot.enabled():
+        failed_tg = telegram_bot.send_payloads(pending["telegram"] + telegram_bot.build_payloads(jobs, borderline))
+    else:
+        print("[i] Telegram disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set)")
+
     if jobs or borderline:
         send_email(jobs, borderline)
 
     with open(PENDING_FILE, "w", encoding="utf-8") as f:
-        json.dump(failed[-20:], f, ensure_ascii=False, indent=2)
+        json.dump({"whatsapp": failed_wa[-20:], "telegram": failed_tg[-60:]}, f, ensure_ascii=False, indent=2)
