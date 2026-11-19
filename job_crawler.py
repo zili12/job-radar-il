@@ -318,6 +318,32 @@ REJECT_TITLE_REGEX = build_reject_title_regex(USER_CONFIG)
 CANDIDATE_TITLE_REGEX = build_candidate_title_regex(USER_CONFIG)
 
 
+HE_WORD_YEARS = {"שנתיים": 2, "שנה": 1, "שנת": 1}
+YEARS_REQ_PATTERN = re.compile(
+    r"(?:(\d{1,2})\s*(?:\+|\s*[-–—]\s*\d{1,2}|\s*to\s*\d{1,2})?\s*(?:years?|yrs?|שנים|שנות)|(שנתיים|שנת|שנה)\s+ניסיון)",
+    re.IGNORECASE,
+)
+NOT_A_REQUIREMENT = re.compile(
+    r"advantage|nice[\s\-]to[\s\-]have|bonus|preferred|a plus|\bplus\b|יתרון|company|founded|our |we have|"
+    r"more than \d+ years|over \d+ years|leader|history|מעל \d+ שנ|החברה",
+    re.IGNORECASE,
+)
+
+
+def find_min_years_required(text):
+    """Regex fallback when the AI reports no years: the highest minimum stated on a
+    requirement line (e.g. '2-4 years of ... experience' -> 2, 'לפחות שנתיים ניסיון' -> 2)."""
+    found = []
+    for line in (text or "").splitlines():
+        if not re.search(r"experience|ניסיון", line, re.IGNORECASE) or NOT_A_REQUIREMENT.search(line):
+            continue
+        for m in YEARS_REQ_PATTERN.finditer(line):
+            n = int(m.group(1)) if m.group(1) else HE_WORD_YEARS[m.group(2)]
+            if 0 < n <= 15:
+                found.append(n)
+    return max(found) if found else None
+
+
 def has_excessive_min_yoe(text, max_allowed_yoe):
     """
     Checks if the job text explicitly requires a minimum number of years > max_allowed_yoe.
@@ -587,7 +613,7 @@ def scrape_single_company(company_info):
         if "challenge-running" in resp.text or "cf-browser-verification" in resp.text:
             return name, False, [], "Cloudflare bot challenge detected", company_info
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = soup_from_response(resp)
         found_candidates = extract_candidates_from_soup(soup, url, company_info)
 
         body_len = len(soup.get_text(strip=True))
@@ -650,6 +676,21 @@ def scrape_spa_with_playwright(failed_list, companies_by_name):
     return recovered_candidates, still_failed
 
 
+def soup_from_response(resp):
+    """Parse HTML with the right encoding. Without a charset header, requests falls back to
+    ISO-8859-1 and Hebrew turns into gibberish, so let BeautifulSoup read the page's own meta charset."""
+    if "charset" in (resp.headers.get("content-type") or "").lower():
+        return BeautifulSoup(resp.text, "html.parser")
+    return BeautifulSoup(resp.content, "html.parser")
+
+
+REQUIREMENTS_MARKER = re.compile(
+    r"requirement|qualification|what you.{0,10}(need|bring|have)|you have|must have|experience|"
+    r"דרישות|כישורים|ניסיון|מה אנחנו מחפשים|מה צריך",
+    re.IGNORECASE,
+)
+
+
 def extract_clean_text_from_soup(soup):
     extracted_text = ""
     detected_loc = "Unspecified"
@@ -671,7 +712,8 @@ def extract_clean_text_from_soup(soup):
                 desc = js_data.get("description", "")
                 if desc:
                     clean_desc = BeautifulSoup(desc, "html.parser").get_text(separator="\n", strip=True)
-                    if len(clean_desc) > 200:
+                    # Some sites put only the "about" blurb in JSON-LD; keep it only if it has the requirements.
+                    if len(clean_desc) > 200 and REQUIREMENTS_MARKER.search(clean_desc):
                         extracted_text = clean_desc[:6000]
                         break
         except Exception:
@@ -687,7 +729,7 @@ def extract_clean_text_from_soup(soup):
             detected_loc = " / ".join(loc_candidates[:2])
 
     if not extracted_text:
-        for elem in soup(["script", "style", "nav", "footer", "noscript", "svg"]):
+        for elem in soup(["script", "style", "nav", "header", "footer", "noscript", "svg"]):
             elem.decompose()
         body_text = soup.get_text(separator="\n", strip=True)
         lines = [line.strip() for line in body_text.splitlines() if len(line.strip()) > 3]
@@ -708,7 +750,7 @@ def fetch_job_details(job):
     try:
         r = requests.get(url, headers=HEADERS, timeout=8)
         if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
+            soup = soup_from_response(r)
             extracted_text, detected_loc = extract_clean_text_from_soup(soup)
     except Exception:
         pass
@@ -918,6 +960,12 @@ def batch_verify_jobs_with_ai(jobs_batch):
             ev["job_index"] = int(ev.get("job_index"))
         except (TypeError, ValueError):
             pass
+        if ev.get("min_years_required") in (None, "") and isinstance(ev.get("job_index"), int) \
+                and 1 <= ev["job_index"] <= len(jobs_batch):
+            regex_years = find_min_years_required(jobs_batch[ev["job_index"] - 1].get("requirements_text", ""))
+            if regex_years is not None:
+                ev["min_years_required"] = regex_years
+                ev["years_from_regex"] = True
         score, breakdown = compute_match_score(ev)
         ev["match_score"] = score
         ev["score_breakdown"] = breakdown
