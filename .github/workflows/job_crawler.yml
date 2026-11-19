@@ -49,6 +49,17 @@ jobs:
         if: env.SCAN_MODE == 'full'
         run: playwright install --with-deps chromium
 
+      # Evaluation log + Telegram feedback mention CV details, so they are kept in the
+      # Actions cache (readable only by this repo's workflows), not committed to the public repo.
+      - name: Restore private data
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            evaluations_log.jsonl
+            feedback.jsonl
+          key: private-data-${{ github.run_id }}
+          restore-keys: private-data-
+
       - name: Run Job Crawler
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -65,11 +76,20 @@ jobs:
         run: |
           python job_crawler.py
 
+      - name: Save private data
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            evaluations_log.jsonl
+            feedback.jsonl
+          key: private-data-${{ github.run_id }}
+
       - name: Commit and Push Updated Seen Jobs
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          for f in seen_jobs.json state.json evaluated_jobs.json evaluations_log.jsonl feedback.jsonl pending_notifications.json; do [ -f "$f" ] && git add "$f"; done
+          for f in seen_jobs.json state.json evaluated_jobs.json pending_notifications.json; do [ -f "$f" ] && git add "$f"; done
           git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update seen jobs database [skip ci]" && git pull --rebase origin main && git push origin main)
 
       - name: Upload Daily Excel Report

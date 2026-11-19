@@ -1,1 +1,130 @@
-[]
+[
+  {
+    "company": "Earnix",
+    "title": "Full-Stack Developer  - Maternity Leave Replacement (8 months) Ramat Gan, Israel",
+    "referral_contact": "הגשה ישירה באתר (ללא רפרל)",
+    "referral_type": "הגשה ישירה",
+    "location": "Ramat Gan",
+    "url": "https://earnix.com/career/e5.470/full-stack-developer-maternity-leave-replacement-8-months/",
+    "experience": "1-2 years",
+    "discovered_at": "2026-11-19T15:28:38.703728",
+    "source": "career_page",
+    "match_score": 98,
+    "match_reason": "Full-Stack עם Python ו-React, 1-2 שנות ניסיון וכלי AI תואמים בדיוק לפרופיל; זו משרה זמנית של 8 חודשים (מחליף/ת חופשת לידה).",
+    "score_breakdown": [
+      "דורש 1 שנים +10",
+      "סטאק תואם +15",
+      "פול סטאק בכותרת +15",
+      "עבודה עם כלי בינה מלאכותית +3",
+      "סיכוי גבוה לזימון +5"
+    ],
+    "posted": "",
+    "job_id": "1c4126809513d0ab"
+  },
+  {
+    "company": "Earnix",
+    "title": "Junior Automation and Frontend  Developer - Maternity Leave Replacement (6 months) Ramat Gan, Israel",
+    "referral_contact": "הגשה ישירה באתר (ללא רפרל)",
+    "referral_type": "הגשה ישירה",
+    "location": "Ramat Gan",
+    "url": "https://earnix.com/career/b7.372/junior-automation-and-frontend-developer-maternity-leave-replacement-6-months/",
+    "experience": "1+ years",
+    "discovered_at": "2026-11-19T15:28:49.846423",
+    "source": "career_page",
+    "match_score": 83,
+    "match_reason": "מתאים מאוד: React ו-TypeScript, דרישת ניסיון של שנה, וניסיון בכלי AI; חסר ניסיון ייעודי באוטומציה, והתפקיד זמני (החלפת חל\"ד ל-6 חודשים).",
+    "score_breakdown": [
+      "דורש 1 שנים +10",
+      "סטאק תואם +15",
+      "עבודה עם כלי בינה מלאכותית +3",
+      "סיכוי גבוה לזימון +5"
+    ],
+    "posted": "",
+    "job_id": "b8926d68836a96c5"
+  },
+  {
+    "company": "Extreme",
+    "title": "Development משרה פתוחה Full Stack Developer רמת גן Development לפרטים ←",
+    "referral_contact": "הגשה ישירה באתר (ללא רפרל)",
+    "referral_type": "הגשה ישירה",
+    "location": "רמת גן",
+    "url": "https://www.extreme.co.il/jobs/full-stack-developer-23154",
+    "experience": "לפחות שנתיים ניסיון בפיתוח Full Stack",
+    "discovered_at": "2026-11-19T15:28:59.240214",
+    "source": "career_page",
+    "match_score": 84,
+    "match_reason": "סטאק React, React Native ו-Node.js תואם היטב, אך נדרשות שנתיים ניסיון (לך ~1.5) וניסיון נייטיבי ב-Java/Swift.",
+    "score_breakdown": [
+      "דורש 2 שנים +10",
+      "סטאק תואם +15",
+      "חסר כחובה: Java/Swift/Objective-C (native mobile) -6",
+      "פול סטאק בכותרת +15"
+    ],
+    "posted": "",
+    "job_id": "34ffd763791bb9af"
+  },
+  {
+    "company": "Fullpath",
+    "title": "Fullstack Engineer - CDP Israel: Tel Aviv More Details",
+    "referral_contact": "הגשה ישירה באתר (ללא רפרל)",
+    "referral_type": "הגשה ישירה",
+    "location": "Tel Aviv",
+    "url": "https://www.fullpath.com/careers/co/israel-tel-aviv/6C.478/fullstack-engineer-cdp/all/",
+    "experience": "Not stated",
+    "discovered_at": "2026-11-19T15:29:09.611011",
+    "source": "career_page",
+    "match_score": 87,
+    "match_reason": "משרת Fullstack/Backend בתל אביב במוצר מבוסס AI שמתאימה לניסיון עם כלי AI, אך התיאור לא מפרט סטאק ודרישות.",
+    "score_breakdown": [
+      "שנים לא צוינו +5",
+      "סטאק תואם חלקית +5",
+      "פול סטאק בכותרת +15",
+      "בונה מוצר בינה מלאכותית +12"
+    ],
+    "posted": "",
+    "job_id": "f0d8685eb2308302"
+  },
+  {
+    "company": "high lander",
+    "title": "Software Engineer All Levels",
+    "referral_contact": "הגשה ישירה באתר (ללא רפרל)",
+    "referral_type": "הגשה ישירה",
+    "location": "Tel Aviv",
+    "url": "https://www.highlander.io/copy-of-software-engineer-all-levels-1",
+    "experience": "Not stated (all levels, junior to senior)",
+    "discovered_at": "2026-11-19T15:29:20.492479",
+    "source": "career_page",
+    "match_score": 73,
+    "match_reason": "משרה פתוחה לכל הרמות בתל אביב (היברידי) עם דגש על עבודה עם כלי AI, Kubernetes/CI/CD ו-cloud שמתאימים לרקע שלך; לא מוגדר סטאק ספציפי.",
+    "score_breakdown": [
+      "שנים לא צוינו +5",
+      "סטאק תואם חלקית +5",
+      "פול סטאק בתיאור +5",
+      "עבודה עם כלי בינה מלאכותית +3",
+      "סיכוי גבוה לזימון +5"
+    ],
+    "posted": "",
+    "job_id": "ce3f09cc73d6c71d"
+  },
+  {
+    "company": "Logica-it",
+    "title": "מפתח/ת Full Stack FULL STACK גוש דן",
+    "referral_contact": "הגשה ישירה באתר (ללא רפרל)",
+    "referral_type": "הגשה ישירה",
+    "location": "Rishon LeZion",
+    "url": "https://logica-it.com/jobs/21300/",
+    "experience": "3+ years",
+    "discovered_at": "2026-11-19T15:30:13.129556",
+    "source": "career_page",
+    "match_score": 83,
+    "match_reason": "Full Stack עם Node.js/NestJS, AWS ו-CI/CD שמתאימים לך, אבל נדרשות 3 שנות ניסיון לעומת כשנה וחצי, ו-Angular/‏.NET Core בצד הלקוח הם פער קטן.",
+    "score_breakdown": [
+      "דורש 3 שנים +0",
+      "סטאק תואם +15",
+      "פול סטאק בכותרת +15",
+      "עבודה עם כלי בינה מלאכותית +3"
+    ],
+    "posted": "",
+    "job_id": "adeb485c3898b029"
+  }
+]
