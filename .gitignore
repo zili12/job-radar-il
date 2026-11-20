@@ -9,3 +9,6 @@ __pycache__/
 .DS_Store
 .venv/
 profile.md
+run_local.log
+evaluations_log.jsonl
+feedback.jsonl
